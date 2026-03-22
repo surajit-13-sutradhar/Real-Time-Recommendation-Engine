@@ -1,14 +1,16 @@
 import uuid
 import logging
 import time
+import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from models import UserEvent, EventResponse, BatchEventRequest, BatchEventResponse
+from kafka_producer import start_producer, stop_producer, publish_event
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,19 +18,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "user-events")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Ingest service starting up")
+    await start_producer(KAFKA_BOOTSTRAP_SERVERS)
+    logger.info("Ingest service ready")
     yield
-    logger.info("Ingest service shutting down")
+    await stop_producer()
+    logger.info("Ingest service shut down")
 
 
 app = FastAPI(title="Event Ingest API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production
+    allow_origins=["*"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -42,9 +49,20 @@ async def health():
 @app.post("/events", response_model=EventResponse, status_code=status.HTTP_202_ACCEPTED)
 async def ingest_event(event: UserEvent):
     event_id = str(uuid.uuid4())
-    logger.info("event_received user_id=%s item_id=%s type=%s event_id=%s",
-                event.user_id, event.item_id, event.event_type, event_id)
-    # Kafka publish goes here in Stage 2
+    payload = {**event.model_dump(), "event_id": event_id}
+
+    published = await publish_event(
+        topic=KAFKA_TOPIC,
+        event=payload,
+        key=event.user_id,   # same user always goes to same partition
+    )
+
+    if not published:
+        logger.warning("kafka_unavailable event_id=%s falling back to log only", event_id)
+
+    logger.info("event_received user_id=%s event_id=%s published=%s",
+                event.user_id, event_id, published)
+
     return EventResponse(status="accepted", event_id=event_id)
 
 
@@ -56,8 +74,8 @@ async def ingest_batch(batch: BatchEventRequest):
     for i, event in enumerate(batch.events):
         try:
             event_id = str(uuid.uuid4())
-            logger.info("batch_event_received index=%d user_id=%s event_id=%s",
-                        i, event.user_id, event_id)
+            payload = {**event.model_dump(), "event_id": event_id}
+            await publish_event(topic=KAFKA_TOPIC, event=payload, key=event.user_id)
             accepted.append(EventResponse(status="accepted", event_id=event_id))
         except Exception as e:
             logger.warning("batch_event_rejected index=%d reason=%s", i, str(e))
